@@ -5,11 +5,14 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+import json
 import os
 from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +21,14 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+DEFAULT_CREDENTIALS_FILE = current_dir / "admin_credentials.json"
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
 
 # In-memory activity database
 activities = {
@@ -78,6 +89,29 @@ activities = {
 }
 
 
+def load_teacher_credentials():
+    credentials_path = Path(os.getenv("ADMIN_CREDENTIALS_FILE", str(DEFAULT_CREDENTIALS_FILE)))
+    if not credentials_path.exists():
+        return {"teachers": []}
+
+    with credentials_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def authenticate_teacher(username: str, password: str) -> bool:
+    credentials = load_teacher_credentials()
+    for teacher in credentials.get("teachers", []):
+        if teacher.get("username") == username and teacher.get("password") == password:
+            return True
+    return False
+
+
+def require_teacher_auth(request: Request):
+    if request.cookies.get("teacher_authenticated") == "true":
+        return
+    raise HTTPException(status_code=403, detail="Teacher authentication required")
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,9 +122,27 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(payload: LoginRequest):
+    if not authenticate_teacher(payload.username, payload.password):
+        raise HTTPException(status_code=401, detail="Invalid teacher credentials")
+
+    response = JSONResponse(content={"message": "Logged in as teacher"})
+    response.set_cookie(
+        key="teacher_authenticated",
+        value="true",
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 8,
+    )
+    return response
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, request: Request):
     """Sign up a student for an activity"""
+    require_teacher_auth(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +163,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, request: Request):
     """Unregister a student from an activity"""
+    require_teacher_auth(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
